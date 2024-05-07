@@ -111,6 +111,7 @@ config WANT_LDC1612
 config WANT_HX71X
     bool
     depends on WANT_GPIO_BITBANGING
+    default y
 config WANT_SOFTWARE_I2C
     bool
     depends on HAVE_GPIO && HAVE_GPIO_I2C

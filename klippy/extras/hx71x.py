@@ -29,9 +29,9 @@ class HX71xBase():
         ppins = printer.lookup_object('pins')
         dout_ppin = ppins.lookup_pin(dout_pin_name)
         sclk_ppin = ppins.lookup_pin(sclk_pin_name)
-        self.mcu = dout_ppin['chip']
-        self.oid = self.mcu.create_oid()
-        if sclk_ppin['chip'] is not self.mcu:
+        self.mcu = mcu = dout_ppin['chip']
+        self.oid = mcu.create_oid()
+        if sclk_ppin['chip'] is not mcu:
             raise config.error("HX71x config error: All HX71x pins must be "
                                "connected to the same MCU")
         self.dout_pin = dout_ppin['pin']
@@ -48,12 +48,10 @@ class HX71xBase():
         ## Measurement conversion
         self._unpack_int32 = struct.Struct("<i").unpack_from
         ## Bulk Sensor Setup
-        self.bulk_queue = bulk_sensor.BulkDataQueue(self.mcu, oid=self.oid)
+        self.bulk_queue = bulk_sensor.BulkDataQueue(mcu, oid=self.oid)
         # Clock tracking
         chip_smooth = self.sps * UPDATE_INTERVAL * 2
-        self.clock_sync = bulk_sensor.ClockSyncRegression(self.mcu, chip_smooth)
-        self.clock_updater = bulk_sensor.ChipClockUpdater(self.clock_sync,
-                                                          BYTES_PER_SAMPLE)
+        self.ffreader = bulk_sensor.FixedFreqReader(mcu, chip_smooth, "<i")
         # Process messages in batches
         self.batch_bulk = bulk_sensor.BatchBulkHelper(
             self.printer, self._process_batch, self._start_measurements,
@@ -63,20 +61,20 @@ class HX71xBase():
                                          self.name,
                                          {'header': ('time', 'total_counts')})
         # Command Configuration
-        self.mcu.add_config_cmd(
+        mcu.add_config_cmd(
             "config_hx71x oid=%d gain_channel=%d dout_pin=%s sclk_pin=%s"
             % (self.oid, self.gain_channel, self.dout_pin, self.sclk_pin))
-        self.mcu.add_config_cmd("query_hx71x oid=%d rest_ticks=0"
+        mcu.add_config_cmd("query_hx71x oid=%d rest_ticks=0"
                                 % (self.oid,), on_restart=True)
 
-        self.mcu.register_config_callback(self._build_config)
+        mcu.register_config_callback(self._build_config)
 
     def _build_config(self):
         self.query_hx71x_cmd = self.mcu.lookup_command(
             "query_hx71x oid=%c rest_ticks=%u")
-        self.clock_updater.setup_query_command(
-            self.mcu, "query_hx71x_status oid=%c", self.oid,
-            self.mcu.alloc_command_queue())
+        self.ffreader.setup_query_command("query_hx71x_status oid=%c",
+                                          oid=self.oid,
+                                          cq=self.mcu.alloc_command_queue())
 
     def get_mcu(self):
         return self.mcu
@@ -94,50 +92,28 @@ class HX71xBase():
     def add_client(self, callback):
         self.batch_bulk.add_client(callback)
 
-    # Measurement decoding
-    def _extract_samples(self, raw_samples):
-        # local variables to optimize inner loop below
-        unpack_int32 = self._unpack_int32
-        # Process every message in capture_buffer
-        max_samples = (len(raw_samples) * MAX_SAMPLES_PER_MESSAGE)
-        samples = collections.deque(maxlen=max_samples)
-        timestamps = TimestampHelper(self.clock_sync, self.clock_updater,
-                                     MAX_SAMPLES_PER_MESSAGE)
-        for params in raw_samples:
-            timestamps.update_sequence(params['sequence'])
-            data = bytearray(params['data'])
-            for i in range(len(data) // BYTES_PER_SAMPLE):
-                counts = unpack_int32(data, offset=BYTES_PER_SAMPLE * i)[0]
-                samples.append((timestamps.time_of_msg(i), counts))
-        timestamps.set_last_chip_clock()
-        return list(samples)
-
     # Start, stop, and process message batches
     def _start_measurements(self):
         # Start bulk reading
-        self.bulk_queue.clear_samples()
         rest_ticks = self.mcu.seconds_to_clock(self.duty_cycle / self.sps)
         self.query_hx71x_cmd.send([self.oid, rest_ticks])
         logging.info("HX71x starting '%s' measurements", self.name)
         # Initialize clock tracking
-        self.clock_updater.note_start()
+        self.ffreader.note_start()
 
     def _finish_measurements(self):
         # Halt bulk reading
         #TODO: this logs errors when klipper shuts down for other reasons
         self.query_hx71x_cmd.send_wait_ack([self.oid, 0])
-        self.bulk_queue.clear_samples()
+        self.ffreader.note_end()
         logging.info("HX71x finished '%s' measurements", self.name)
 
     def _process_batch(self, eventtime):
-        self.clock_updater.update_clock()
-        raw_samples = self.bulk_queue.pull_samples()
-        if not raw_samples:
-            return {}
-        samples = self._extract_samples(raw_samples)
+        samples = self.ffreader.pull_samples()
         if not samples:
             return {}
-        return {'data': samples}
+        return {'data': samples,
+                'error_code': self.ffreader.get_last_overflows()}
 
 
 class HX711(HX71xBase):

@@ -6,7 +6,6 @@
 import collections
 import logging, struct
 from . import bulk_sensor, bus
-from .bulk_adc_sensor import (TimestampHelper)
 
 #
 # Constants
@@ -59,15 +58,12 @@ class ADS1220():
         if drdy_pin_mcu != self.mcu:
             raise config.error("ADS1220 config error: SPI communication and"
                                " data_ready_pin must be on the same MCU")
-        # Measurement conversion
-        self._unpack_int32 = struct.Struct('<i').unpack_from
         # Bulk Sensor Setup
         self.bulk_queue = bulk_sensor.BulkDataQueue(self.mcu, oid=self.oid)
         # Clock tracking
         chip_smooth = self.sps * UPDATE_INTERVAL * 2
-        self.clock_sync = bulk_sensor.ClockSyncRegression(self.mcu, chip_smooth)
-        self.clock_updater = bulk_sensor.ChipClockUpdater(self.clock_sync,
-                                                          BYTES_PER_SAMPLE)
+        # Measurement conversion
+        self.ffreader = bulk_sensor.FixedFreqReader(mcu, chip_smooth, "<i")
         # Process messages in batches
         self.batch_bulk = bulk_sensor.BatchBulkHelper(
             self.printer, self._process_batch, self._start_measurements,
@@ -89,8 +85,8 @@ class ADS1220():
         cmdqueue = self.spi.get_command_queue()
         self.query_ads1220_cmd = self.mcu.lookup_command(
             "query_ads1220 oid=%c rest_ticks=%u", cq=cmdqueue)
-        self.clock_updater.setup_query_command(
-            self.mcu, "query_ads1220_status oid=%c", self.oid, cq=cmdqueue)
+        self.ffreader.setup_query_command("query_ads1220_status oid=%c",
+                                          oid=self.oid, cq=cmdqueue)
 
     def get_mcu(self):
         return self.mcu
@@ -108,52 +104,30 @@ class ADS1220():
     def add_client(self, callback):
         self.batch_bulk.add_client(callback)
 
-    # Measurement decoding
-    def _extract_samples(self, raw_blocks):
-        # local variables to optimize inner loop below
-        unpack_int32 = self._unpack_int32
-        # Process every message in capture_buffer
-        max_samples = (len(raw_blocks) * MAX_SAMPLES_PER_MESSAGE)
-        samples = collections.deque(maxlen=max_samples)
-        timestamps = TimestampHelper(self.clock_sync, self.clock_updater,
-                                     MAX_SAMPLES_PER_MESSAGE)
-        for block in raw_blocks:
-            timestamps.update_sequence(block['sequence'])
-            data = bytearray(block['data'])
-            for i in range(len(data) // BYTES_PER_SAMPLE):
-                counts = unpack_int32(data, offset=BYTES_PER_SAMPLE * i)[0]
-                samples.append((timestamps.time_of_msg(i), counts))
-        timestamps.set_last_chip_clock()
-        return list(samples)
-
     # Start, stop, and process message batches
     def _start_measurements(self):
         # Start bulk reading
-        self.bulk_queue.clear_samples()
         self.reset_chip()
         self.setup_chip()
         rest_ticks = self.mcu.seconds_to_clock(0.7 / float(self.sps))
         self.query_ads1220_cmd.send([self.oid, rest_ticks])
         logging.info("ADS1220 starting '%s' measurements", self.name)
         # Initialize clock tracking
-        self.clock_updater.note_start()
+        self.ffreader.note_start()
 
     def _finish_measurements(self):
         # Halt bulk reading
         # TODO: this logs errors when klipper shuts down for other reasons
         self.query_ads1220_cmd.send_wait_ack([self.oid, 0])
-        self.bulk_queue.clear_samples()
+        self.ffreader.note_end()
         logging.info("ADS1220 finished '%s' measurements", self.name)
 
     def _process_batch(self, eventtime):
-        self.clock_updater.update_clock()
-        raw_samples = self.bulk_queue.pull_samples()
-        if not raw_samples:
-            return {}
-        samples = self._extract_samples(raw_samples)
+        samples = self.ffreader.pull_samples()
         if not samples:
             return {}
-        return {'data': samples}
+        return {'data': samples,
+                'error_code': self.ffreader.get_last_overflows()}
 
     def reset_chip(self):
         # the reset command takes 50us to complete
