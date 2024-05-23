@@ -116,8 +116,10 @@ class ADS1220():
         self.ffreader.note_start()
 
     def _finish_measurements(self):
+        # don't use serial connection after shutdown
+        if self.printer.is_shutdown():
+            return
         # Halt bulk reading
-        # TODO: this logs errors when klipper shuts down for other reasons
         self.query_ads1220_cmd.send_wait_ack([self.oid, 0])
         self.ffreader.note_end()
         logging.info("ADS1220 finished '%s' measurements", self.name)
