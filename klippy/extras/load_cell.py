@@ -6,6 +6,7 @@
 import collections, logging
 from . import hx71x
 from . import ads1220
+from . import ads1256
 from .bulk_sensor import BatchWebhooksClient
 
 class SaturationException(Exception):
@@ -479,6 +480,7 @@ def load_config(config):
     sensors = {}
     sensors.update(hx71x.HX71X_SENSOR_TYPES)
     sensors.update(ads1220.ADS1220_SENSOR_TYPE)
+    sensors.update(ads1256.ADS1256_SENSOR_TYPE)
     sensor_class = config.getchoice('sensor_type', sensors)
     return LoadCell(config, sensor_class(config))
 
